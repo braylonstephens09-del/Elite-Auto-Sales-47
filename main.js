@@ -4,369 +4,358 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-let currentView = 'public';
+const e = React.createElement;
+const { useState, useEffect } = React;
 
-const viewSelector = document.getElementById('viewSelector');
-const publicView = document.getElementById('publicView');
-const staffView = document.getElementById('staffView');
-const customerView = document.getElementById('customerView');
-
-viewSelector.addEventListener('change', (e) => {
-  currentView = e.target.value;
-  renderCurrentView();
-});
-
-function renderCurrentView() {
-  publicView.classList.add('hidden');
-  staffView.classList.add('hidden');
-  customerView.classList.add('hidden');
-
-  if (currentView === 'public') {
-    publicView.classList.remove('hidden');
-    renderPublicView();
-  } else if (currentView === 'staff') {
-    staffView.classList.remove('hidden');
-    renderStaffView();
-  } else if (currentView === 'customer') {
-    customerView.classList.remove('hidden');
-    renderCustomerView();
-  }
+function currency(n){ return '$' + (Number(n||0).toFixed(2)); }
+const MONTHS = 96;
+function calcMonthly(retail, down){
+  const p = Math.max(0, Number(retail||0) - Number(down||0));
+  return (p / MONTHS).toFixed(2);
 }
 
-async function renderPublicView() {
-  publicView.innerHTML = `
-    <div class="card">
-      <h2>Available Vehicles</h2>
-      <p style="color: #718096; margin-bottom: 16px;">Buy Here Pay Here - In-house financing available</p>
-      <div class="row">
-        <input type="text" id="searchInput" placeholder="Search by make or model..." />
-        <button class="btn" onclick="window.loadVehicles()">Search</button>
-      </div>
-    </div>
-    <div id="vehicleGrid" class="grid">
-      <div class="loading">Loading vehicles...</div>
-    </div>
-  `;
-
-  await loadVehicles();
-}
-
-async function loadVehicles() {
-  const searchInput = document.getElementById('searchInput');
-  const searchTerm = searchInput?.value.toLowerCase() || '';
-
-  const vehicleGrid = document.getElementById('vehicleGrid');
-  vehicleGrid.innerHTML = '<div class="loading">Loading vehicles...</div>';
-
-  try {
-    let query = supabase
-      .from('vehicles')
-      .select('*')
-      .eq('sold', false)
-      .order('created_at', { ascending: false });
-
-    const { data: vehicles, error } = await query;
-
-    if (error) throw error;
-
-    let filteredVehicles = vehicles || [];
-    if (searchTerm) {
-      filteredVehicles = filteredVehicles.filter(v =>
-        (v.make?.toLowerCase().includes(searchTerm) ||
-         v.model?.toLowerCase().includes(searchTerm))
-      );
+async function runInsuranceCheckNow(){
+  const { data: customers } = await supabase.from('customers').select('*');
+  if(!customers) return;
+  for(const c of customers){
+    const ins = c.insurance || {};
+    if(!ins.expiration || new Date(ins.expiration) < new Date()){
+      await supabase.from('staff_alerts').insert({
+        type: 'Insurance Expired/Missing',
+        customer_id: c.id,
+        details: `Customer ${c.name} insurance is expired or missing`,
+        seen: false
+      });
     }
-
-    if (filteredVehicles.length === 0) {
-      vehicleGrid.innerHTML = '<div class="loading">No vehicles found. Staff can add vehicles from the Staff Portal.</div>';
-      return;
-    }
-
-    vehicleGrid.innerHTML = filteredVehicles.map(vehicle => `
-      <div class="vehicle-card" onclick="window.showVehicleDetails('${vehicle.id}')">
-        <img src="${vehicle.image_url || 'https://images.pexels.com/photos/164634/pexels-photo-164634.jpeg?auto=compress&cs=tinysrgb&w=600'}"
-             alt="${vehicle.make} ${vehicle.model}"
-             class="vehicle-image">
-        <div class="vehicle-info">
-          <div class="vehicle-title">${vehicle.year || ''} ${vehicle.make} ${vehicle.model}</div>
-          <div class="vehicle-price">$${vehicle.price?.toLocaleString()}</div>
-          <div class="vehicle-details">Down: $${vehicle.down_payment?.toLocaleString() || 0}</div>
-          <div class="vehicle-details">Est. Monthly: $${calculateMonthly(vehicle.price, vehicle.down_payment)}</div>
-        </div>
-      </div>
-    `).join('');
-  } catch (error) {
-    vehicleGrid.innerHTML = `<div class="error">Error loading vehicles: ${error.message}</div>`;
   }
+  alert('Insurance check completed');
 }
 
-function calculateMonthly(price, downPayment) {
-  const financed = (price || 0) - (downPayment || 0);
-  const monthly = financed / 96;
-  return monthly.toFixed(2);
+window.runInsuranceCheckNow = runInsuranceCheckNow;
+
+function App(){
+  const [route, setRoute] = useState('public');
+  const [customerId, setCustomerId] = useState('');
+  return e('div',null,
+    e('div',{className:'header'}, e('h1',null,'Elite Auto Sales'), e('div',{className:'nav'},
+      e('select',{value:route,onChange:ev=>setRoute(ev.target.value)}, e('option',{value:'public'},'Public Site'), e('option',{value:'staff'},'Staff Portal'), e('option',{value:'customer'},'Customer Portal')),
+      e('input',{placeholder:'Customer ID (demo)', style:{marginLeft:8,padding:8,borderRadius:6,border:'1px solid #ddd'}, value:customerId, onChange:ev=>setCustomerId(ev.target.value)}),
+      e('a',{href:'https://eliteautosalesal.com','target':'_blank', className:'small', style:{marginLeft:8,textDecoration:'underline'}}, 'Original Site')
+    )),
+    route === 'public' ? e(PublicSite) : route === 'staff' ? e(StaffShell) : e(CustomerShell,{customerId})
+  );
 }
 
-async function showVehicleDetails(vehicleId) {
-  try {
-    const { data: vehicle, error } = await supabase
-      .from('vehicles')
-      .select('*')
-      .eq('id', vehicleId)
-      .maybeSingle();
+function PublicSite(){
+  const [vehicles, setVehicles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [pageSize] = useState(20);
+  const [lastVisible, setLastVisible] = useState(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [filter, setFilter] = useState({q:'', maxPrice:'', minPrice:'', make:''});
+  const [selectedVehicle, setSelectedVehicle] = useState(null);
+  const [calcInput, setCalcInput] = useState({retail:'',down:''});
+  const [aiOpen, setAiOpen] = useState(false);
 
-    if (error) throw error;
-    if (!vehicle) throw new Error('Vehicle not found');
+  useEffect(()=>{
+    loadPage(null);
+  },[]);
 
-    const modal = document.createElement('div');
-    modal.className = 'modal';
-    modal.innerHTML = `
-      <div class="modal-content">
-        <div class="modal-header">
-          <h2>${vehicle.year || ''} ${vehicle.make} ${vehicle.model}</h2>
-          <button class="close-btn" onclick="this.closest('.modal').remove()">×</button>
-        </div>
-        <img src="${vehicle.image_url || 'https://images.pexels.com/photos/164634/pexels-photo-164634.jpeg?auto=compress&cs=tinysrgb&w=1200'}"
-             alt="${vehicle.make} ${vehicle.model}"
-             style="width: 100%; border-radius: 8px; margin-bottom: 20px;">
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
-          <div>
-            <strong>Price:</strong> $${vehicle.price?.toLocaleString()}
-          </div>
-          <div>
-            <strong>Down Payment:</strong> $${vehicle.down_payment?.toLocaleString() || 0}
-          </div>
-          <div>
-            <strong>Year:</strong> ${vehicle.year || 'N/A'}
-          </div>
-          <div>
-            <strong>Seats:</strong> ${vehicle.seats || 'N/A'}
-          </div>
-        </div>
-        <div style="margin-bottom: 20px;">
-          <strong>Maintenance History:</strong>
-          <p style="color: #718096; margin-top: 8px;">${vehicle.maintenance || 'No maintenance records available'}</p>
-        </div>
-        <div style="background: #f7fafc; padding: 16px; border-radius: 8px;">
-          <strong>Financing Estimate (96 payments):</strong>
-          <div style="font-size: 24px; color: #667eea; font-weight: 700; margin-top: 8px;">
-            $${calculateMonthly(vehicle.price, vehicle.down_payment)} / month
-          </div>
-        </div>
-      </div>
-    `;
+  async function loadPage(start){
+    setLoading(true);
+    let query = supabase.from('vehicles').select('*').eq('sold', false).order('created_at',{ascending:false}).limit(pageSize);
+    const { data, error } = await query;
+    if(error){ console.error(error); setLoading(false); return; }
+    const docs = data || [];
+    if(start) setVehicles(prev => prev.concat(docs)); else setVehicles(docs);
+    setHasMore(docs.length === pageSize);
+    setLoading(false);
+  }
 
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) modal.remove();
+  const filtered = vehicles.filter(v => {
+    if(filter.q && !((v.make||'') + ' ' + (v.model||'')).toLowerCase().includes(filter.q.toLowerCase())) return false;
+    if(filter.make && (v.make||'').toLowerCase() !== filter.make.toLowerCase()) return false;
+    if(filter.minPrice && Number(v.price||0) < Number(filter.minPrice)) return false;
+    if(filter.maxPrice && Number(v.price||0) > Number(filter.maxPrice)) return false;
+    return true;
+  });
+
+  return e('div',null,
+    e('div',{className:'card'}, e('h2',null,'Inventory — Elite Auto Sales'), e('div',{className:'muted small'}, 'Buy Here Pay Here — in-house financing up to 96 payments'),
+      e('div',{className:'searchbar'}, e('input',{placeholder:'Search make or model', value:filter.q, onChange:ev=>setFilter({...filter,q:ev.target.value})}), e('input',{placeholder:'Max price', value:filter.maxPrice, onChange:ev=>setFilter({...filter, maxPrice:ev.target.value})}), e('input',{placeholder:'Min price', value:filter.minPrice, onChange:ev=>setFilter({...filter, minPrice:ev.target.value})}), e('button',{className:'btn secondary', onClick:()=>setFilter({q:'',maxPrice:'',minPrice:'',make:''})}, 'Clear'))),
+    e('div',{className:'card'}, e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+      e('div',null, e('span',{className:'tag'}, 'Semi-monthly payments: 15th & last')),
+      e('div',null, e('button',{className:'btn', onClick:()=>setAiOpen(true)}, 'AI Assistant'), ' ', e('button',{className:'btn secondary', onClick:()=>{ document.getElementById('payment-calc')?.scrollIntoView({behavior:"smooth"}) } }, 'Payment Calculator'))
+    )),
+    e('div',{className:'grid'},
+      filtered.map(v => e('div',{key:v.id, className:'vehicle-card', onClick:()=>setSelectedVehicle(v)},
+        e('img',{src:v.image_url || 'https://via.placeholder.com/400x300?text=No+Image', className:'vehicle-image'}),
+        e('div',null, e('strong',null, v.make + ' ' + v.model)),
+        e('div',null, currency(v.price), ' • Down: ', currency(v.down_payment || 0)),
+        e('div',{className:'small'}, 'Payment est (96): $' + calcMonthly(v.price, v.down_payment))
+      ))
+    ),
+    e('div',null, hasMore ? e('button',{className:'btn', onClick:()=>loadPage(lastVisible)}, loading ? 'Loading…' : 'Load more') : e('div',{className:'muted small', style:{marginTop:8}}, 'End of list for now')),
+
+    e('div',{id:'payment-calc', className:'card'},
+      e('h3',null,'Payment Calculator'),
+      e('div',{className:'row'}, e('input',{className:'half',placeholder:'Retail price', value:calcInput.retail, onChange:ev=>setCalcInput({...calcInput, retail:ev.target.value})}), e('input',{className:'half', placeholder:'Down payment', value:calcInput.down, onChange:ev=>setCalcInput({...calcInput, down:ev.target.value})})),
+      e('div',{className:'small', style:{marginTop:8}}, '96 payments (~4 years)'),
+      e('div',{className:'calc-out', style:{marginTop:8}}, 'Estimated payment: $' + calcMonthly(calcInput.retail||0, calcInput.down||0))
+    ),
+
+    selectedVehicle ? e('div',{className:'modal', onClick:()=>setSelectedVehicle(null)},
+      e('div',{className:'modal-card', onClick:ev=>ev.stopPropagation()},
+        e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}}, e('h3',null, selectedVehicle.make + ' ' + selectedVehicle.model), e('button',{className:'btn secondary', onClick:()=>setSelectedVehicle(null)}, 'Close')),
+        e('div',null, e('img',{src:selectedVehicle.image_url || 'https://via.placeholder.com/800x500?text=No+Image', className:'gallery-img'})),
+        e('div',{style:{marginTop:8}}, e('strong',null,'Price: '), currency(selectedVehicle.price), e('div',null,'Down: ' + currency(selectedVehicle.down_payment || 0))),
+        e('div',{style:{marginTop:8}}, e('strong',null,'Maintenance / History:'), e('div',null, selectedVehicle.maintenance || 'None recorded')),
+        e('div',{style:{marginTop:12}}, e('button',{className:'btn', onClick:()=>{ alert('To pay online, staff will create a PaymentIntent via Stripe or customer pays via staff portal.'); }}, 'Pay / Request Payment Link'))
+      )
+    ) : null,
+
+    aiOpen ? e(AIAssistant,{onClose:()=>setAiOpen(false)}) : null
+  );
+}
+
+function AIAssistant({onClose}){
+  const [step, setStep] = useState(0);
+  const [state, setState] = useState({budget:'', seats:'', mustHave:''});
+  const [result, setResult] = useState(null);
+
+  const questions = [
+    {key:'budget', label:'Monthly budget (USD)'},
+    {key:'seats', label:'Number of seats needed (e.g., 2,4,5)'},
+    {key:'mustHave', label:'Must-haves (4WD, low miles, etc.) (optional)'}
+  ];
+
+  const next = async ()=>{
+    if(step < questions.length - 1) return setStep(step + 1);
+    const bud = Number(state.budget||0);
+    const { data } = await supabase.from('vehicles').select('*').eq('sold', false).order('created_at',{ascending:false}).limit(500);
+    const candidates = [];
+    (data||[]).forEach(v => {
+      const p = Number(((v.price||0) - (v.down_payment||0)) / 96);
+      let score = 0;
+      if(p <= bud) score += 2;
+      if(state.mustHave && ( (v.maintenance||'').toLowerCase().includes(state.mustHave.toLowerCase()) || (v.make+' '+v.model).toLowerCase().includes(state.mustHave.toLowerCase()) )) score += 1;
+      if(state.seats && state.seats != '' && String(v.seats || '').includes(state.seats)) score += 1;
+      if(score>0) candidates.push({v,score,monthly:p});
     });
+    candidates.sort((a,b)=>b.score - a.score || a.monthly - b.monthly);
+    setResult(candidates.slice(0,10));
+    setStep(step+1);
+  };
 
-    document.body.appendChild(modal);
-  } catch (error) {
-    alert('Error loading vehicle details: ' + error.message);
-  }
+  return e('div',{className:'modal', onClick:()=>onClose()},
+    e('div',{className:'modal-card', onClick:ev=>ev.stopPropagation()},
+      e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}}, e('h3',null,'AI Car Finder'), e('button',{className:'btn secondary', onClick:()=>onClose()}, 'Close')),
+      step <= questions.length -1 ? e('div',null,
+        e('div',null, e('label',null, questions[step].label)),
+        e('input',{placeholder:questions[step].label, value: state[questions[step].key]||'', onChange:ev=>setState({...state, [questions[step].key]: ev.target.value})}),
+        e('div',{style:{marginTop:8}}, e('button',{className:'btn', onClick:next}, step < questions.length -1 ? 'Next' : 'Find Matches'))
+      ) : result ? e('div',null,
+        e('h4',null,'Top Matches'),
+        ...result.map(r => e('div',{key:r.v.id, className:'card'},
+          e('div',{style:{display:'flex',gap:12}}, e('img',{src:r.v.image_url||'https://via.placeholder.com/200', style:{width:120,height:80,objectFit:'cover',borderRadius:6}}),
+            e('div',null, e('strong',null, r.v.make + ' ' + r.v.model), e('div',null,'Est monthly: $' + Number(r.monthly).toFixed(2)), e('div',null,'Price: ' + currency(r.v.price)))
+          )
+        )),
+        e('div',{style:{marginTop:8}}, e('button',{className:'btn', onClick:onClose}, 'Close'))
+      ) : e('div',null, 'No matches found.')
+    )
+  );
 }
 
-async function renderStaffView() {
-  staffView.innerHTML = `
-    <div class="card">
-      <h2>Staff Portal</h2>
-      <p style="color: #718096; margin-bottom: 20px;">Manage inventory and customers</p>
-
-      <h3>Add New Vehicle</h3>
-      <div class="row">
-        <input type="text" id="staffMake" placeholder="Make" class="col" />
-        <input type="text" id="staffModel" placeholder="Model" class="col" />
-        <input type="number" id="staffYear" placeholder="Year" class="col" />
-      </div>
-      <div class="row">
-        <input type="number" id="staffPrice" placeholder="Price" class="col" />
-        <input type="number" id="staffDown" placeholder="Down Payment" class="col" />
-        <input type="number" id="staffSeats" placeholder="Seats" class="col" />
-      </div>
-      <input type="url" id="staffImageUrl" placeholder="Image URL (optional)" />
-      <textarea id="staffMaintenance" placeholder="Maintenance history..." rows="3"></textarea>
-      <button class="btn" onclick="window.addVehicle()">Add Vehicle</button>
-
-      <div id="staffMessage" style="margin-top: 16px;"></div>
-    </div>
-
-    <div class="card">
-      <h3>Current Inventory</h3>
-      <div id="staffInventory">
-        <div class="loading">Loading inventory...</div>
-      </div>
-    </div>
-  `;
-
-  await loadStaffInventory();
+function StaffShell(){
+  return e('div',{className:'frazer-like'},
+    e('div',{className:'sidebar card'}, e('h3',null,'Staff Portal'), e('div',{className:'muted small'}, 'Frazer-style menu'),
+      e('div',null, e('button',{className:'btn', onClick:()=>document.getElementById('staff-main')?.scrollIntoView({behavior:'smooth'})}, 'Inventory')),
+      e('div',null, e('button',{className:'btn secondary', onClick:()=>document.getElementById('customers-main')?.scrollIntoView({behavior:'smooth'})}, 'Customers')),
+      e('div',null, e('button',{className:'btn secondary', onClick:()=>document.getElementById('alerts-main')?.scrollIntoView({behavior:'smooth'})}, 'Alerts')),
+      e('div',null, e('button',{className:'btn secondary', onClick:seedSampleVehicles}, 'Seed Sample Vehicles (adds ~50)')),
+      e('div',{style:{marginTop:12}}, e('div',{className:'small'}, 'Staff login & roles coming later'))
+    ),
+    e('div',{className:'content', id:'staff-main'}, e(StaffPortal))
+  );
 }
 
-async function loadStaffInventory() {
-  const staffInventory = document.getElementById('staffInventory');
+function StaffPortal(){
+  const [vehicles,setVehicles] = useState([]);
+  const [customers,setCustomers] = useState([]);
+  const [alerts,setAlerts] = useState([]);
+  const [form,setForm] = useState({make:'',model:'',year:'',price:'',downPayment:'',imageUrl:'',maintenance:'',seats:''});
+  const [manualPay,setManualPay] = useState({customerId:'',vehicleId:'',amount:'',method:'Cash',notes:''});
 
-  try {
-    const { data: vehicles, error } = await supabase
-      .from('vehicles')
-      .select('*')
-      .order('created_at', { ascending: false });
+  useEffect(()=>{
+    const loadData = async () => {
+      const { data: v } = await supabase.from('vehicles').select('*').order('created_at',{ascending:false});
+      setVehicles(v||[]);
+      const { data: c } = await supabase.from('customers').select('*').order('created_at',{ascending:false});
+      setCustomers(c||[]);
+      const { data: a } = await supabase.from('staff_alerts').select('*').order('date',{ascending:false});
+      setAlerts(a||[]);
+    };
+    loadData();
+    const interval = setInterval(loadData, 5000);
+    return ()=>clearInterval(interval);
+  },[]);
 
-    if (error) throw error;
+  const addVehicle = async ()=>{
+    if(!form.make || !form.model) return alert('Enter make & model');
+    await supabase.from('vehicles').insert({
+      make: form.make,
+      model: form.model,
+      year: form.year ? parseInt(form.year) : null,
+      price: Number(form.price||0),
+      down_payment: Number(form.downPayment||0),
+      maintenance: form.maintenance || '',
+      image_url: form.imageUrl || '',
+      seats: form.seats ? parseInt(form.seats) : null,
+      sold: false
+    });
+    setForm({make:'',model:'',year:'',price:'',downPayment:'',imageUrl:'',maintenance:'',seats:''});
+    alert('Vehicle added');
+    const { data } = await supabase.from('vehicles').select('*').order('created_at',{ascending:false});
+    setVehicles(data||[]);
+  };
 
-    if (!vehicles || vehicles.length === 0) {
-      staffInventory.innerHTML = '<p style="color: #718096;">No vehicles in inventory</p>';
-      return;
-    }
+  const addCustomer = async ()=>{
+    const name = prompt('Customer name?'); if(!name) return;
+    const { data, error } = await supabase.from('customers').insert({ name, email:'', phone:'', vehicle_id:null, balance_remaining:0, payment_plan:'semi-monthly', next_payment_due:null, pickup_note:null, insurance:'{}' }).select();
+    if(error) { alert('Error: '+error.message); return; }
+    alert('Customer added. ID: ' + data[0].id);
+    const { data: c } = await supabase.from('customers').select('*').order('created_at',{ascending:false});
+    setCustomers(c||[]);
+  };
 
-    staffInventory.innerHTML = vehicles.map(v => `
-      <div style="border: 2px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 12px;">
-        <div style="display: flex; justify-content: space-between; align-items: start;">
-          <div>
-            <strong>${v.year || ''} ${v.make} ${v.model}</strong>
-            <div style="color: #718096; font-size: 14px;">
-              Price: $${v.price?.toLocaleString()} | Down: $${v.down_payment?.toLocaleString() || 0}
-              ${v.sold ? ' | <span style="color: #e53e3e;">SOLD</span>' : ''}
-            </div>
-          </div>
-          <button class="btn btn-secondary" onclick="window.toggleSold('${v.id}', ${v.sold})" style="padding: 6px 12px;">
-            ${v.sold ? 'Mark Available' : 'Mark Sold'}
-          </button>
-        </div>
-      </div>
-    `).join('');
-  } catch (error) {
-    staffInventory.innerHTML = `<div class="error">Error loading inventory: ${error.message}</div>`;
-  }
+  const addManualPayment = async ()=>{
+    if(!manualPay.customerId || !manualPay.amount) return alert('Customer and amount required');
+    await supabase.from('payments').insert({ customer_id:manualPay.customerId, vehicle_id:manualPay.vehicleId||null, amount:Number(manualPay.amount), method:manualPay.method, notes:manualPay.notes||'' });
+    const { data: snap } = await supabase.from('customers').select('*').eq('id', manualPay.customerId).maybeSingle();
+    if(snap) await supabase.from('customers').update({ balance_remaining: (snap.balance_remaining||0) - Number(manualPay.amount) }).eq('id', manualPay.customerId);
+    alert('Payment recorded');
+    setManualPay({customerId:'',vehicleId:'',amount:'',method:'Cash',notes:''});
+  };
+
+  const markHandled = async (id) => {
+    await supabase.from('staff_alerts').update({ seen:true }).eq('id', id);
+    const { data: a } = await supabase.from('staff_alerts').select('*').order('date',{ascending:false});
+    setAlerts(a||[]);
+  };
+
+  return e('div',null,
+    e('div',{className:'card'}, e('h3',null,'Inventory Manager'),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Make', value:form.make, onChange:ev=>setForm({...form,make:ev.target.value})}), e('input',{className:'half', placeholder:'Model', value:form.model, onChange:ev=>setForm({...form,model:ev.target.value})})),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Year', value:form.year, onChange:ev=>setForm({...form,year:ev.target.value})}), e('input',{className:'half', placeholder:'Seats (optional)', value:form.seats, onChange:ev=>setForm({...form,seats:ev.target.value})})),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Retail price', value:form.price, onChange:ev=>setForm({...form,price:ev.target.value})}), e('input',{className:'half', placeholder:'Down payment', value:form.downPayment, onChange:ev=>setForm({...form,downPayment:ev.target.value})})),
+      e('input',{placeholder:'Primary image URL', value:form.imageUrl, onChange:ev=>setForm({...form,imageUrl:ev.target.value})}),
+      e('textarea',{placeholder:'Maintenance & costs (comma separated)', value:form.maintenance, onChange:ev=>setForm({...form,maintenance:ev.target.value})}),
+      e('div',{className:'small'}, 'Est monthly (96): $' + calcMonthly(form.price || 0, form.downPayment || 0)),
+      e('div',null, e('button',{className:'btn', onClick:addVehicle}, 'Add Vehicle'))
+    ),
+    e('div',{id:'customers-main', className:'card'}, e('h3',null,'Customers'), e('button',{className:'btn', onClick:addCustomer}, 'Add Customer'),
+      customers.length === 0 ? e('div',null,'No customers yet') : customers.map(c => e('div',{key:c.id, style:{padding:8,border:'1px solid #eee',borderRadius:6,marginTop:6}},
+        e('div',{style:{fontWeight:'bold'}}, c.name + ' (ID: ' + c.id + ')'),
+        e('div',null,'Balance: ' + currency(c.balance_remaining||0)),
+        e('div',null,'Pickup Note: ' + (c.pickup_note ? ('$' + c.pickup_note.amount + ' due ' + new Date(c.pickup_note.dueDate).toLocaleDateString()) : 'None')),
+        e('div',null,'Insurance: ' + (c.insurance && c.insurance.company ? (c.insurance.company + ' / ' + c.insurance.coverage) : 'None'))
+      ))
+    ),
+    e('div',{className:'card'}, e('h3',null,'Payments'),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Customer ID', value:manualPay.customerId, onChange:ev=>setManualPay({...manualPay,customerId:ev.target.value})}), e('input',{className:'half', placeholder:'Vehicle ID', value:manualPay.vehicleId, onChange:ev=>setManualPay({...manualPay,vehicleId:ev.target.value})})),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Amount', value:manualPay.amount, onChange:ev=>setManualPay({...manualPay,amount:ev.target.value})}), e('select',{className:'half', value:manualPay.method, onChange:ev=>setManualPay({...manualPay,method:ev.target.value})}, e('option',{value:'Cash'}, 'Cash'), e('option',{value:'Card'}, 'Card'), e('option',{value:'Phone'}, 'Phone'))),
+      e('textarea',{placeholder:'Notes', value:manualPay.notes, onChange:ev=>setManualPay({...manualPay,notes:ev.target.value})}),
+      e('div',null, e('button',{className:'btn', onClick:addManualPayment}, 'Record In-Person Payment'))
+    ),
+    e('div',{id:'alerts-main', className:'card'}, e('h3',null,'Alerts / Repo / Compliance'),
+      e('div',null, e('button',{className:'btn', onClick:runInsuranceCheckNow}, 'Run Insurance Check Now (manual)')),
+      alerts.length===0 ? e('div',null,'No alerts') : alerts.map(a => e('div',{key:a.id, className:'alert', style:{padding:8,border:'1px solid #eee',borderRadius:6,marginTop:6}},
+        e('div',null, e('strong',null,a.type)),
+        e('div',null,'Customer: ' + (a.customer_id || 'N/A')),
+        e('div',null,'Details: ' + (a.details||'')),
+        !a.seen ? e('div',null, e('button',{className:'btn', onClick:()=>markHandled(a.id)}, 'Mark Handled')) : e('div',null,'Handled')
+      ))
+    )
+  );
 }
 
-async function addVehicle() {
-  const make = document.getElementById('staffMake').value;
-  const model = document.getElementById('staffModel').value;
-  const year = document.getElementById('staffYear').value;
-  const price = document.getElementById('staffPrice').value;
-  const downPayment = document.getElementById('staffDown').value;
-  const seats = document.getElementById('staffSeats').value;
-  const imageUrl = document.getElementById('staffImageUrl').value;
-  const maintenance = document.getElementById('staffMaintenance').value;
-  const staffMessage = document.getElementById('staffMessage');
-
-  if (!make || !model || !price) {
-    staffMessage.innerHTML = '<div class="error">Please fill in Make, Model, and Price</div>';
-    return;
-  }
-
-  try {
-    const { error } = await supabase
-      .from('vehicles')
-      .insert([{
-        make,
-        model,
-        year: year ? parseInt(year) : null,
-        price: parseFloat(price),
-        down_payment: downPayment ? parseFloat(downPayment) : 0,
-        seats: seats ? parseInt(seats) : null,
-        image_url: imageUrl || null,
-        maintenance: maintenance || null,
-        sold: false
-      }]);
-
-    if (error) throw error;
-
-    staffMessage.innerHTML = '<div class="success">Vehicle added successfully!</div>';
-
-    document.getElementById('staffMake').value = '';
-    document.getElementById('staffModel').value = '';
-    document.getElementById('staffYear').value = '';
-    document.getElementById('staffPrice').value = '';
-    document.getElementById('staffDown').value = '';
-    document.getElementById('staffSeats').value = '';
-    document.getElementById('staffImageUrl').value = '';
-    document.getElementById('staffMaintenance').value = '';
-
-    await loadStaffInventory();
-
-    setTimeout(() => {
-      staffMessage.innerHTML = '';
-    }, 3000);
-  } catch (error) {
-    staffMessage.innerHTML = `<div class="error">Error adding vehicle: ${error.message}</div>`;
-  }
+function CustomerShell({customerId}){
+  return e('div',null, e('div',{className:'content'}, e(CustomerPortal,{customerId})));
 }
 
-async function toggleSold(vehicleId, currentStatus) {
-  try {
-    const { error } = await supabase
-      .from('vehicles')
-      .update({ sold: !currentStatus })
-      .eq('id', vehicleId);
+function CustomerPortal({customerId}){
+  const [cust,setCust] = useState(null);
+  const [calc, setCalc] = useState({retail:'',down:''});
 
-    if (error) throw error;
+  useEffect(()=>{
+    const loadCustomer = async () => {
+      if(!customerId) { setCust(null); return; }
+      const { data } = await supabase.from('customers').select('*').eq('id', customerId).maybeSingle();
+      setCust(data);
+    };
+    loadCustomer();
+    const interval = setInterval(loadCustomer, 5000);
+    return ()=>clearInterval(interval);
+  },[customerId]);
 
-    await loadStaffInventory();
-  } catch (error) {
-    alert('Error updating vehicle: ' + error.message);
-  }
+  const updateInsurance = async (k, v) => {
+    if(!customerId) return alert('No customer id');
+    const { data: snap } = await supabase.from('customers').select('*').eq('id', customerId).maybeSingle();
+    const cur = snap?.insurance || {};
+    await supabase.from('customers').update({ insurance: { ...cur, [k]: v } }).eq('id', customerId);
+    alert('Insurance saved');
+  };
+
+  return e('div',null,
+    e('div',{className:'card'}, e('h3',null,'Customer Account'),
+      !customerId ? e('div',null,'Enter your Customer ID in the top-right to load your account (staff can add customers in Staff Portal)') :
+      cust ? e('div',null, e('div',null, e('strong',null,'Name: '), cust.name), e('div',null, e('strong',null,'Balance: '), currency(cust.balance_remaining||0)), e('div',null, e('strong',null,'Payment Plan: '), cust.payment_plan || 'semi-monthly'), e('div',null, e('strong',null,'Pickup Note: '), cust.pickup_note ? ('$' + cust.pickup_note.amount + ' due ' + new Date(cust.pickup_note.dueDate).toLocaleDateString()) : 'None') ) : e('div',null,'Customer not found')
+    ),
+
+    e('div',{className:'card'}, e('h3',null,'Insurance (edit)'),
+      e('input',{placeholder:'Company', defaultValue:cust?.insurance?.company||'', onBlur:ev=>updateInsurance('company', ev.target.value)}),
+      e('input',{placeholder:'Policy #', defaultValue:cust?.insurance?.policyNumber||'', onBlur:ev=>updateInsurance('policyNumber', ev.target.value)}),
+      e('input',{placeholder:'Coverage (type full)', defaultValue:cust?.insurance?.coverage||'', onBlur:ev=>updateInsurance('coverage', ev.target.value)}),
+      e('input',{placeholder:'Deductible (500-1000)', defaultValue:cust?.insurance?.deductible||'', onBlur:ev=>updateInsurance('deductible', Number(ev.target.value||0))}),
+      e('input',{placeholder:'Lienholder', defaultValue:cust?.insurance?.lienholder||'Elite Auto Sales', onBlur:ev=>updateInsurance('lienholder', ev.target.value)}),
+      e('input',{placeholder:'Expiration YYYY-MM-DD', defaultValue:cust?.insurance?.expiration||'', onBlur:ev=>updateInsurance('expiration', ev.target.value)})
+    ),
+
+    e('div',{className:'card'}, e('h3',null,'Payment Calculator (also on homepage)'),
+      e('div',{className:'row'}, e('input',{className:'half', placeholder:'Retail', value:calc.retail, onChange:ev=>setCalc({...calc,retail:ev.target.value})}), e('input',{className:'half', placeholder:'Down', value:calc.down, onChange:ev=>setCalc({...calc,down:ev.target.value})})),
+      e('div',{className:'calc-out'}, 'Estimated Monthly: $' + calcMonthly(calc.retail||0, calc.down||0))
+    )
+  );
 }
 
-async function renderCustomerView() {
-  customerView.innerHTML = `
-    <div class="card">
-      <h2>Customer Portal</h2>
-      <p style="color: #718096; margin-bottom: 20px;">Manage your account and view purchase details</p>
-
-      <div class="row">
-        <input type="text" id="customerId" placeholder="Enter your Customer ID" class="col" />
-        <button class="btn" onclick="window.loadCustomerData()">Load Account</button>
-      </div>
-
-      <div id="customerData"></div>
-    </div>
-  `;
+async function seedSampleVehicles(){
+  if(!confirm('This will add 50 sample vehicles to your database for testing. Proceed?')) return;
+  const makes = ['Ford','Chevrolet','Toyota','Nissan','Honda','Dodge','Jeep','GMC','Kia','Hyundai'];
+  const models = ['Focus','Impala','Camry','Altima','Civic','Charger','Wrangler','Sierra','Soul','Elantra'];
+  const imgs = [
+    'https://images.unsplash.com/photo-1542362567-b07e54358753?w=1200&q=80',
+    'https://images.unsplash.com/photo-1502877338535-766e1452684a?w=1200&q=80',
+    'https://images.unsplash.com/photo-1511919884226-fd3cad34687c?w=1200&q=80',
+    'https://images.unsplash.com/photo-1483729558449-99ef09a8c325?w=1200&q=80'
+  ];
+  const batch = [];
+  for(let i=0;i<50;i++){
+    const make = makes[Math.floor(Math.random()*makes.length)];
+    const model = models[Math.floor(Math.random()*models.length)];
+    const price = Math.floor(2000 + Math.random()*22000);
+    const down = Math.floor(200 + Math.random()*3000);
+    batch.push({
+      make, model, year: 2000 + Math.floor(Math.random()*25),
+      price, down_payment: down, maintenance: 'Inspected, detailed', image_url: imgs[i % imgs.length],
+      seats: 4 + Math.floor(Math.random()*3),
+      sold: false
+    });
+  }
+  await supabase.from('vehicles').insert(batch);
+  alert('Added 50 sample vehicles. Reload to see them.');
 }
 
-async function loadCustomerData() {
-  const customerId = document.getElementById('customerId').value;
-  const customerData = document.getElementById('customerData');
+window.seedSampleVehicles = seedSampleVehicles;
 
-  if (!customerId) {
-    customerData.innerHTML = '<div class="error">Please enter a Customer ID</div>';
-    return;
-  }
-
-  customerData.innerHTML = '<div class="loading">Loading customer data...</div>';
-
-  try {
-    const { data: customer, error } = await supabase
-      .from('customers')
-      .select('*')
-      .eq('id', customerId)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    if (!customer) {
-      customerData.innerHTML = '<div class="error">Customer not found</div>';
-      return;
-    }
-
-    customerData.innerHTML = `
-      <div style="margin-top: 24px; padding: 20px; background: #f7fafc; border-radius: 8px;">
-        <h3 style="margin-bottom: 16px;">Account Information</h3>
-        <div style="display: grid; gap: 12px;">
-          <div><strong>Name:</strong> ${customer.name}</div>
-          <div><strong>Email:</strong> ${customer.email || 'Not provided'}</div>
-          <div><strong>Phone:</strong> ${customer.phone || 'Not provided'}</div>
-          <div><strong>Balance Remaining:</strong> <span style="color: #667eea; font-weight: 700;">$${customer.balance_remaining?.toLocaleString() || 0}</span></div>
-        </div>
-      </div>
-    `;
-  } catch (error) {
-    customerData.innerHTML = `<div class="error">Error loading customer data: ${error.message}</div>`;
-  }
-}
-
-window.loadVehicles = loadVehicles;
-window.showVehicleDetails = showVehicleDetails;
-window.addVehicle = addVehicle;
-window.toggleSold = toggleSold;
-window.loadCustomerData = loadCustomerData;
-
-renderCurrentView();
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
